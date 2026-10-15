@@ -1,11 +1,15 @@
 import * as XLSX from 'xlsx';
 
 /**
- * Format angka ke format Rupiah (contoh: Rp 150.000)
+ * Format angka ke format Rupiah (contoh: Rp 150.000 atau -Rp 177.200)
  */
 export function formatRupiah(value) {
   if (value === undefined || value === null || isNaN(value)) return 'Rp 0';
-  return 'Rp ' + Number(value).toLocaleString('id-ID');
+  const num = Number(value);
+  if (num < 0) {
+    return '-Rp ' + Math.abs(num).toLocaleString('id-ID');
+  }
+  return 'Rp ' + num.toLocaleString('id-ID');
 }
 
 /**
@@ -65,10 +69,10 @@ export function exportToExcel(reportData, customFileName = '') {
     ]);
   });
 
-  // Baris Grand Total
+  // Baris Total Akumulasi Produk
   wsData.push([]);
   wsData.push([
-    'TOTAL KESELURUHAN',
+    'TOTAL AKUMULASI PRODUK',
     '',
     '',
     '',
@@ -78,8 +82,41 @@ export function exportToExcel(reportData, customFileName = '') {
     reportData.totals.net,
     reportData.totals.qty > 0 ? Math.round(reportData.totals.net / reportData.totals.qty) : 0,
     '100%',
-    ''
+    reportData.metadata?.totalRawItems || ''
   ]);
+
+  // Tambahkan catatan rekonsiliasi jika ada perbedaan dengan baris Grand Total asli POS
+  if (reportData.reconciliation && reportData.reconciliation.hasDifference) {
+    const rec = reportData.reconciliation;
+    wsData.push([]);
+    wsData.push(['CATATAN REKONSILIASI DENGAN FILE POS ASLI:']);
+    wsData.push([
+      '• Baris Grand Total bawaan file POS:',
+      '',
+      '',
+      '',
+      rec.posRecorded.qty,
+      rec.posRecorded.gross,
+      rec.posRecorded.discount,
+      rec.posRecorded.net,
+      '',
+      '',
+      'Data Nota Kasir POS'
+    ]);
+    wsData.push([
+      '• Selisih Transaksi / Diskon Nota Global:',
+      '',
+      '',
+      '',
+      rec.diff.qty,
+      rec.diff.gross,
+      rec.diff.discount,
+      rec.diff.net,
+      '',
+      '',
+      'Diskon/Penyesuaian Nota'
+    ]);
+  }
 
   // Buat Worksheet
   const ws = XLSX.utils.aoa_to_sheet(wsData);
@@ -96,7 +133,7 @@ export function exportToExcel(reportData, customFileName = '') {
     { wch: 28 }, // Penjualan Bersih
     { wch: 25 }, // Rata-rata / Cup
     { wch: 24 }, // Kontribusi
-    { wch: 22 }  // Varian Asal
+    { wch: 26 }  // Varian Asal
   ];
 
   // Buat Workbook dan simpan
@@ -145,7 +182,7 @@ export function exportToCSV(reportData, customFileName = '') {
   // Grand Total
   rows.push([
     'TOTAL',
-    'TOTAL KESELURUHAN',
+    'TOTAL AKUMULASI PRODUK',
     '-',
     '-',
     reportData.totals.qty,
@@ -185,8 +222,8 @@ export function formatWhatsAppMessage(reportData, notes = '') {
   }
   msg += `------------------------------------\n\n`;
 
-  // Top 3 / 5 Best Sellers
-  msg += `🏆 *PRODUK TERLARIS:*\n`;
+  // Top 5 Best Sellers
+  msg += `🏆 *PRODUK TERLARIS (TOP 5):*\n`;
   const topList = summary.slice(0, 5);
   topList.forEach((p, idx) => {
     msg += `${idx + 1}. *${p.productName}*: ${formatNumber(p.qty)} cup (${formatRupiah(p.netSales)})\n`;
@@ -198,14 +235,21 @@ export function formatWhatsAppMessage(reportData, notes = '') {
   });
 
   msg += `\n------------------------------------\n`;
-  msg += `💰 *RINGKASAN TOTAL:*\n`;
+  msg += `💰 *RINGKASAN TOTAL PENJUALAN:*\n`;
   msg += `• Total Terjual: *${formatNumber(totals.qty)} cup*\n`;
   msg += `• Penjualan Kotor: ${formatRupiah(totals.gross)}\n`;
-  msg += `• Diskon: ${formatRupiah(totals.discount)}\n`;
-  msg += `• Total Penjualan Bersih: *${formatRupiah(totals.net)}*\n`;
+  msg += `• Total Diskon: ${formatRupiah(totals.discount)}\n`;
+  msg += `• Penjualan Bersih (Net): *${formatRupiah(totals.net)}*\n`;
   const avgCup = totals.qty > 0 ? Math.round(totals.net / totals.qty) : 0;
   msg += `• Rata-rata per Cup: ${formatRupiah(avgCup)}\n`;
-  msg += `• Efisiensi Varian: Dirangkum dari ${reportData.metadata?.totalRawItems || '-'} baris detail menjadi *${summary.length} produk*\n`;
+  msg += `• Ringkasan: Dari ${reportData.metadata?.totalRawItems || '-'} baris kustomisasi disederhanakan menjadi *${summary.length} produk*\n`;
+
+  // Catatan rekonsiliasi jika file POS asli memiliki perbedaan nota
+  if (reportData.reconciliation && reportData.reconciliation.hasDifference) {
+    const rec = reportData.reconciliation;
+    msg += `\n📌 *Audit POS:* Penjumlahan riil item = ${formatNumber(rec.productSum.qty)} cup (${formatRupiah(rec.productSum.net)}). Baris Grand Total nota POS = ${formatNumber(rec.posRecorded.qty)} cup (${formatRupiah(rec.posRecorded.net)}), selisih nota = ${formatNumber(rec.diff.qty)} cup (${formatRupiah(rec.diff.net)}).\n`;
+  }
+
   msg += `------------------------------------\n`;
   msg += `_Laporan dibuat otomatis dengan HuyCha Sales Summarizer_ 🧋`;
 

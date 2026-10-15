@@ -1,6 +1,42 @@
 import * as XLSX from 'xlsx';
 
 /**
+ * Parsing angka secara aman dari berbagai format:
+ * - Integer / Float asli
+ * - String format Indonesia: "1.828.000", "-177.200", "19.000,50"
+ * - String format Akuntansi: "(177.200)" -> -177200
+ * - String dengan simbol mata uang: "Rp 19.000", "IDR 50.000"
+ */
+export function parseSafeNumber(val) {
+  if (val === undefined || val === null || val === '') return 0;
+  if (typeof val === 'number') return isNaN(val) ? 0 : val;
+
+  let str = String(val).trim();
+
+  // Format akuntansi dalam kurung: (177.200) -> -177.200
+  if (/^\(.*\)$/.test(str)) {
+    str = '-' + str.slice(1, -1).trim();
+  }
+
+  // Bersihkan teks mata uang (Rp, IDR, $, dll) dan spasi berlebih
+  str = str.replace(/^(Rp\.?|IDR|\$)\s*/i, '').trim();
+
+  // Format ribuan titik Indonesia: 1.828.000 atau -177.200
+  if (/^-?\d{1,3}(\.\d{3})+(,\d+)?$/.test(str)) {
+    str = str.replace(/\./g, '').replace(',', '.');
+  } else if (/^-?\d{1,3}(,\d{3})+(\.\d+)?$/.test(str)) {
+    // Format US: 1,828,000.00
+    str = str.replace(/,/g, '');
+  } else if (/^-?\d+,\d+$/.test(str)) {
+    // Format desimal koma tunggal: 19000,5
+    str = str.replace(',', '.');
+  }
+
+  const num = Number(str);
+  return isNaN(num) ? 0 : num;
+}
+
+/**
  * Membersihkan nama produk dari atribut kustomisasi seperti sugar level dan ice level.
  * Contoh:
  * "Roasted Smoky Oolong Milk Tea - 16 oz - 100% - 70%" -> "Roasted Smoky Oolong Milk Tea - 16 oz"
@@ -11,7 +47,7 @@ export function cleanProductName(rawName, options = {}) {
   let cleaned = rawName.trim();
 
   // 1. Bersihkan akhiran persentase berantai (misal: " - 100% - 70%", " - 50% - 30%")
-  // Bisa disertai teks opsional seperti Sugar / Ice / Es / Gula
+  // Bisa disertai kata opsional seperti Sugar / Ice / Es / Gula
   cleaned = cleaned.replace(/(\s*[-/|]\s*\d+%\s*(sugar|ice|es|gula)?\s*)+$/i, '');
 
   // 2. Bersihkan format kurung persentase (misal: "(100% - 70%)" atau "(100%, 70%)")
@@ -20,7 +56,7 @@ export function cleanProductName(rawName, options = {}) {
   // 3. Bersihkan sisa persentase di ujung jika ada
   cleaned = cleaned.replace(/\s*[-/|]\s*\d+%\s*$/i, '');
 
-  // 4. Opsi tambahan jika ingin menggabungkan ukuran (16 oz / 22 oz)
+  // 4. Opsi tambahan jika pengguna ingin menggabungkan ukuran (16 oz / 22 oz)
   if (options.stripSize) {
     cleaned = cleaned.replace(/\s*[-/|]\s*\d+\s*(oz|ml|l|cup|medium|large|regular|small)\b/i, '');
   }
@@ -82,17 +118,21 @@ export function reAggregateReportData(existingReport, options) {
   }
 
   const summaryList = Array.from(aggregatedMap.values()).map(item => {
+    // Pembulatan harga rata-rata per cup
     const avgPrice = item.qty > 0 ? Math.round(item.netSales / item.qty) : 0;
-    const contributionPct = totalNet > 0 ? ((item.netSales / totalNet) * 100) : 0;
-    const qtyPct = totalQty > 0 ? ((item.qty / totalQty) * 100) : 0;
+    // Persentase kontribusi omset dan volume
+    const contributionPct = totalNet > 0 ? Number(((item.netSales / totalNet) * 100).toFixed(2)) : 0;
+    const qtyPct = totalQty > 0 ? Number(((item.qty / totalQty) * 100).toFixed(2)) : 0;
+
     return {
       ...item,
       avgPrice,
-      contributionPct: Number(contributionPct.toFixed(2)),
-      qtyPct: Number(qtyPct.toFixed(2))
+      contributionPct,
+      qtyPct
     };
   });
 
+  // Urutkan default berdasarkan jumlah cup terjual terbanyak (Best seller)
   summaryList.sort((a, b) => b.qty - a.qty);
 
   return {
@@ -118,7 +158,7 @@ export async function parseSalesReportFile(file, options = {}) {
         const workbook = XLSX.read(data, { type: 'array' });
         const sheetName = workbook.SheetNames[0];
         const sheet = workbook.Sheets[sheetName];
-        
+
         // Baca sebagai array 2D
         const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: '' });
 
@@ -154,7 +194,7 @@ export async function parseSalesReportFile(file, options = {}) {
         }
 
         const headers = rows[headerRowIndex].map(h => String(h || '').trim());
-        
+
         // Pemetaan indeks kolom
         let idxName = headers.findIndex(h => /nama produk|produk|item/i.test(h));
         let idxCategory = headers.findIndex(h => /kategori|category/i.test(h));
@@ -163,7 +203,7 @@ export async function parseSalesReportFile(file, options = {}) {
         let idxDiscount = headers.findIndex(h => /diskon|discount|potongan/i.test(h));
         let idxTotal = headers.findIndex(h => /total|net|bersih/i.test(h));
 
-        // Fallback default jika pos Pawoon standar
+        // Fallback default jika posisi Pawoon standar
         if (idxName === -1) idxName = 0;
         if (idxCategory === -1) idxCategory = 2;
         if (idxQty === -1) idxQty = 4;
@@ -177,19 +217,43 @@ export async function parseSalesReportFile(file, options = {}) {
         let totalRawDiscount = 0;
         let totalRawNet = 0;
 
+        // Simpan baris Grand Total asli dari file POS jika ada
+        let posGrandTotal = null;
+
         for (let i = headerRowIndex + 1; i < rows.length; i++) {
           const row = rows[i];
           const rawName = String(row[idxName] || '').trim();
 
-          if (!rawName || /grand total|total keseluruhan/i.test(rawName)) {
+          if (!rawName) continue;
+
+          // Cek apakah ini baris Grand Total bawaan file POS
+          if (/grand total|total keseluruhan/i.test(rawName)) {
+            posGrandTotal = {
+              found: true,
+              rowIndex: i + 1,
+              label: rawName,
+              qty: parseSafeNumber(row[idxQty]),
+              gross: parseSafeNumber(row[idxGross]),
+              discount: parseSafeNumber(row[idxDiscount]),
+              net: parseSafeNumber(row[idxTotal])
+            };
             continue;
           }
 
           const category = String(row[idxCategory] || 'Minuman').trim() || 'Minuman';
-          const qty = Number(row[idxQty]) || 0;
-          const gross = Number(row[idxGross]) || 0;
-          const discount = Number(row[idxDiscount]) || 0;
-          const net = Number(row[idxTotal]) || (gross + discount);
+          const qty = parseSafeNumber(row[idxQty]);
+          const gross = parseSafeNumber(row[idxGross]);
+          const discount = parseSafeNumber(row[idxDiscount]);
+
+          // Tentukan Net secara tepat:
+          // Jika kolom Total ada di baris, gunakan nilai eksplisit dari kolom tersebut.
+          // Jika kosong, hitung gross + discount (karena diskon bernilai negatif pada POS Pawoon).
+          let net = 0;
+          if (row[idxTotal] !== undefined && row[idxTotal] !== null && String(row[idxTotal]).trim() !== '') {
+            net = parseSafeNumber(row[idxTotal]);
+          } else {
+            net = gross + discount;
+          }
 
           totalRawQty += qty;
           totalRawGross += gross;
@@ -217,6 +281,32 @@ export async function parseSalesReportFile(file, options = {}) {
           }
         }
 
+        // Hitung rekonsiliasi jika file memiliki baris Grand Total bawaan POS
+        let reconciliation = null;
+        if (posGrandTotal) {
+          const qtyDiff = totalRawQty - posGrandTotal.qty;
+          const grossDiff = totalRawGross - posGrandTotal.gross;
+          const discountDiff = totalRawDiscount - posGrandTotal.discount;
+          const netDiff = totalRawNet - posGrandTotal.net;
+
+          reconciliation = {
+            hasDifference: (qtyDiff !== 0 || grossDiff !== 0 || discountDiff !== 0 || netDiff !== 0),
+            posRecorded: posGrandTotal,
+            productSum: {
+              qty: totalRawQty,
+              gross: totalRawGross,
+              discount: totalRawDiscount,
+              net: totalRawNet
+            },
+            diff: {
+              qty: qtyDiff,
+              gross: grossDiff,
+              discount: discountDiff,
+              net: netDiff
+            }
+          };
+        }
+
         const baseReport = {
           fileName: file.name,
           fileSize: file.size,
@@ -233,11 +323,11 @@ export async function parseSalesReportFile(file, options = {}) {
             discount: totalRawDiscount,
             net: totalRawNet
           },
+          reconciliation,
           summary: [],
           rawItems
         };
 
-        // Agregasi
         const finalized = reAggregateReportData(baseReport, options);
         resolve(finalized);
       } catch (err) {
